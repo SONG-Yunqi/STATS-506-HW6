@@ -1,0 +1,409 @@
+---
+title: "Untitled"
+format:
+  html:
+    embed-resources: true
+editor: visual
+---
+
+## github link
+
+<https://github.com/SONG-Yunqi/STATS-506-HW6>
+
+## Question 1
+
+```{r}
+library(Rcpp)
+library(e1071)
+```
+
+```{r}
+cppFunction('
+  double C_moment(NumericVector x, int k) {
+    int n = x.size();
+    if (n == 0) return NA_REAL;
+
+    double m1 = 0.0;
+    for (int i = 0; i < n; i++) {
+      m1 += x[i];
+    }
+    m1 /= n;
+
+    double m2 = 0.0;
+    for (int i = 0; i < n; i++) {
+      m2 += pow(x[i] - m1, k);
+    }
+
+    return m2 / n;
+  }
+')
+
+```
+
+We generate a sample and compare the results of our C_moment function and e1071::moment.
+
+```{r}
+set.seed(42)
+x = rnorm(1000,2,2.5)
+k = 5
+
+moment(x,k,center = TRUE)
+
+C_moment(x,k)
+```
+
+We see the results are equal.
+
+## Question 2
+
+### (a)
+
+```{r}
+library(parallel)
+source('waldCI.R')
+```
+
+```{r}
+setClass("bootstrapWaldCI",
+         contains = "waldCI",
+         slots = c(f = "function",
+                   data = "ANY",             
+                   reps = "numeric",    
+                   compute = "character"))
+
+setGeneric("rebootstrap", function(object) {
+  standardGeneric("rebootstrap")
+})
+
+makeBootstrapCI = function(f, data, reps, level = 0.95, compute = "serial") {
+  
+  n = nrow(data)
+  boot_values = numeric(reps)
+  
+  if (compute == "serial") {
+    
+    boot_values = sapply(1:reps, function(i) {
+      idx = sample.int(n, n, replace = TRUE)
+      boot_data = data[idx, , drop = FALSE]
+      return(f(boot_data))
+    })
+    
+  } else if (compute == "parallel") {
+    
+    num_cores = max(1, detectCores() - 1)
+    cl = makeCluster(num_cores)
+    on.exit(stopCluster(cl))
+    
+    clusterExport(cl, varlist = c("data", "f", "n"), envir = environment())
+    
+    boot_values = parSapply(cl, 1:reps, function(i) {
+      idx = sample.int(n, n, replace = TRUE)
+      boot_data = data[idx, , drop = FALSE]
+      return(f(boot_data))
+    })
+    
+  } else {
+    stop("compute argument must be 'serial' or 'parallel'")
+  }
+  
+  original_est = f(data)
+  boot_se = sd(boot_values)
+  
+  new("bootstrapWaldCI",
+      mean = original_est,
+      sterr = boot_se,
+      level = level,
+      f = f,
+      data = data,
+      reps = reps,
+      compute = compute)
+}
+
+setMethod("rebootstrap", "bootstrapWaldCI", function(object) {
+  makeBootstrapCI(f = object@f,
+                  data = object@data,
+                  reps = object@reps,
+                  level = object@level,
+                  compute = object@compute)
+})
+```
+
+### (b)
+
+```{r}
+ci1 <- makeBootstrapCI(function(x) mean(x$y),
+                       ggplot2::diamonds,
+                       reps = 1000)
+ci1
+rebootstrap(ci1)
+```
+
+### (c)
+
+```{r}
+dispCoef = function(data) {
+  fit = lm(mpg ~ cyl + disp + wt, data = data)
+  return(coef(fit)["disp"])
+}
+
+t_start = Sys.time()
+ci2 = makeBootstrapCI(f = dispCoef,
+                      data = mtcars,
+                      reps = 1000,
+                      compute = "serial")
+t_end = Sys.time()
+print(ci2)
+cat("Serial Time:", t_end - t_start, "\n")
+
+ci2_new = rebootstrap(ci2)
+print(ci2_new)
+
+t_start = Sys.time()
+ci2_para = makeBootstrapCI(f = dispCoef,
+                           data = mtcars,
+                           reps = 1000,
+                           compute = "parallel")
+t_end = Sys.time()
+cat("Parallel Time:", t_end - t_start, "\n")
+```
+
+We see that the serial time is smaller than parallel time. In fact, the dataset is small and therefore the model fitting is very fast. As a result, the overhead of setting up the parallel cluster typically outweighs the time saved by splitting the work.
+
+## Question 3
+
+### (a)
+
+We first load the data.
+
+```{r}
+load(file = 'data.RData')
+head(df)
+```
+
+```{r}
+table(df['country'])
+```
+
+```{r}
+library(tidyverse)
+
+# standardize the data
+df_std = df %>%
+  group_by(country) %>%
+  mutate(
+    prior_gpa_z = as.numeric(scale(prior_gpa)),
+    forum_posts_z = as.numeric(scale(forum_posts)),
+    quiz_attempts_z = as.numeric(scale(quiz_attempts))
+  ) %>%
+  ungroup()
+```
+
+Fit models.
+
+```{r}
+library(lme4)
+
+df_list = split(df_std, df_std$country)
+
+models = vector("list", length(df_list))
+times  = vector("list", length(df_list))
+coef_forum = c()
+
+for (i in seq_along(df_list)){
+  d = df_list[[i]]
+  t = system.time({
+    model = glmer(
+      completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z + (1 | device_type),
+      data = d,
+      family = binomial,
+      control = glmerControl(optimizer = "bobyqa",
+                             optCtrl   = list(maxfun = 2e5))
+    )}
+  )
+  
+  models[[i]] = model
+  times[[i]]  = t
+  cm = summary(model)$coefficients
+  coef_forum = append(coef_forum,cm["forum_posts_z", "Estimate"])
+}
+```
+
+```{r}
+coef_df = data.frame(country = names(df_list), value = coef_forum)
+
+ggplot(coef_df, aes(x = reorder(country, value), y = value)) +
+  xlab('Estimated Coefficient') +
+  ylab('Country') +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(value, 3)),
+            hjust = ifelse(coef_df$value >= 0, -0.2, 1.2),
+            size = 4) +
+  coord_flip() +
+  theme_minimal(base_size = 14)
+```
+
+Report the running time.
+
+```{r}
+names(times) = names(df_list)
+times
+```
+
+### (b)
+
+```{r}
+library(parallel)
+
+n_cores = min(detectCores() - 1, length(df_list))
+cl = makeCluster(n_cores)
+
+clusterExport(cl, varlist = c("df_list"))
+clusterEvalQ(cl, { library(lme4) })
+
+total_time = system.time({
+  results = parLapply(cl, seq_along(df_list), function(i) {
+    d = df_list[[i]]
+    model = glmer(
+      completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z + (1 | device_type),
+      data = d,
+      family = binomial,
+      control = glmerControl(optimizer = "bobyqa",
+                             optCtrl   = list(maxfun = 2e5))
+    )
+    
+    return(model)
+  })
+})
+
+stopCluster(cl)
+```
+
+```{r}
+total_time
+```
+
+```{r}
+coef_forum1 = c()
+
+for (i in 1:length(df_list)){
+  model = results[[i]]
+  cm = summary(model)$coefficients
+  coef_forum1 = append(coef_forum1,cm["forum_posts_z", "Estimate"])
+}
+
+coef_df1 = data.frame(country = names(df_list), value = coef_forum1)
+
+ggplot(coef_df1, aes(x = reorder(country, value), y = value)) +
+  xlab('Estimated Coefficient') +
+  ylab('Country') +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(value, 3)),
+            hjust = ifelse(coef_df$value >= 0, -0.2, 1.2),
+            size = 4) +
+  coord_flip() +
+  theme_minimal(base_size = 14)
+```
+
+## Question 4
+
+### (a)
+
+```{r}
+library(data.table)
+library(stringr)
+
+matches <- fread(
+  "atp_matches_2019.txt",
+  sep   = ",",
+  quote = "",
+  fill  = TRUE
+)
+
+head(matches)
+```
+
+Here I just assume all matches take place in 2018 are parts of tourney ending in 2019. In addition, I handle the special case of David cup.
+
+```{r}
+total_tournament_count = matches[
+  , tourney_name := str_replace(tourney_name, "Davis.*", "Davis Cup")
+][
+  , .(total_tournament_count = uniqueN(tourney_name))
+]
+
+total_tournament_count
+```
+
+There are 69 tournaments in 2019.
+
+### (b)
+
+For each tournament, the last match was the one with biggest match_num. So the tournament winner should be the winner of the last match.
+
+```{r}
+t2 = matches[
+  matches[, .I[which.max(match_num)], by = tourney_id]$V1,
+  .(tourney_id, winner_name)  
+][
+  , .(winning_count = .N), by = winner_name
+][
+  winning_count > 1 
+][
+  order(-winning_count)  
+]
+
+nrow(t2)
+```
+
+```{r}
+t2
+```
+
+There are 17 players who won more than 1 tournament. The most winning player won 9 tournaments.
+
+### (c)
+
+We use a one-side paired t-test to solve this question. For each match, we will compute diff = w_ace - l_ace. Then we will test whether the mean of diff is 0. If a match has missing w_ace or l_ace, we just remove that match.
+
+```{r}
+t3 = matches[
+  !is.na(w_ace) & !is.na(l_ace),
+  {
+    diff = w_ace - l_ace
+    .(t = sqrt(.N) * mean(diff) / sd(diff))
+  }
+]
+
+t3
+```
+
+We see the observed t-statistic is greater than 1.64. Then we have strong evidence that the winner ace is greater than the loser ace.
+
+### (d)
+
+```{r}
+t4_long = melt(
+  matches[, .(win = winner_name, lose = loser_name)],
+  measure.vars  = c("win", "lose"),
+  variable.name = "result",  
+  value.name    = "name"     
+)
+
+t4 = t4_long[
+  , .(
+    win_cnt   = sum(result == "win"),
+    lose_cnt  = sum(result == "lose"),
+    total_cnt = .N,
+    win_rate  = sum(result == "win") / .N
+  ),
+  by = name
+][
+  total_cnt >= 5
+]
+
+t4 = t4[win_rate == max(win_rate)]
+
+t4
+```
+
+Rafael Nadal has the highest winning rate.
